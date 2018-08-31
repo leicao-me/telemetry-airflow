@@ -3,9 +3,14 @@ import time
 from os import environ
 
 import boto3
+from io import BytesIO
+from gzip import GzipFile
+from urllib import urlparse
+from tempfile import gettempdir
 import requests
 from airflow.models import BaseOperator
 from airflow.utils.decorators import apply_defaults
+from airflow.utils.email import send_email
 from airflow.exceptions import AirflowException
 from retrying import retry
 
@@ -152,7 +157,7 @@ class EMRSparkOperator(BaseOperator):
             args += ['--arguments', '"{}"'.format(self.arguments)]
 
         self.steps = [{
-            'Name': 'RunJobStep',
+            'Name': 'self.step_name',
             'ActionOnFailure': 'TERMINATE_JOB_FLOW',
             'HadoopJarStep': {
                 'Jar': jar_url,
@@ -253,3 +258,68 @@ class EMRSparkOperator(BaseOperator):
                 "Spark Job '{}' status' is {}".format(self.job_name, status)
             )
             time.sleep(300)
+
+    def get_failed_step_logs(self):
+        logs = {'stdout': '', 'stderr': ''}
+
+        try:
+            emr_client = boto3.client('emr', region_name=EMRSparkOperator.region)
+            response = emr_client.list_steps(ClusterId=self.job_flow_id, StepStates=['FAILED'])
+            step_file_loc = urlparse(response['Steps'][0]['FailureDetails']['LogFile'])
+            bucket = step_file_loc.netloc
+            base_key = step_file_loc.path.lstrip('/')
+            s3 = boto3.client('s3')
+
+            for logfile in ['stdout', 'stderr']:
+                try:
+                    obj = s3.get_object(Bucket=bucket, Key=base_key + 'stdout.gz')
+                    bytestream = BytesIO(obj['Body'].read())
+                    logs[logfile] = GzipFile(None, 'rb', fileobj=bytestream).read().decode('utf-8')
+                except:
+                    pass
+        except:
+            pass
+
+        return logs
+
+    def get_spark_log(self):
+        logfile = None
+        try:
+            emr_client = boto3.client('emr', region_name=EMRSparkOperator.region)
+            master = [instance['Ec2InstanceId'] for instance
+                      in emr_client.list_instances(ClusterId=self.job_flow_id)][0]
+            cluster = emr_client.describe_cluster(ClusterId=self.job_flow_id)
+            log_loc = urlparse(cluster['Cluster']['LogUri'])
+            key = '{}{}/node/{}/applications/spark/spark.log.gz'.format(log_loc.path, self.job_flow_id, master)
+            tempfile = '{}/{}-spark.log.gz'.format(gettempdir(), self.job_flow_id)
+            s3 = boto3.client('s3')
+            s3.download_file(log_loc.netloc, key, tempfile)
+            logfile = [tempfile]
+        except:
+            pass
+        return logfile
+
+    def email_alert(self, exception, is_retry=False):
+        # This method is based on the email_alert implementation in BaseOperator in airflow 1.9. If we upgrade we
+        # should check make sure this stays in line with the upstream implementation
+        step_logs = self.get_failed_step_logs()
+        files = self.get_spark_log()
+
+        task = self.task
+        title = "Airflow alert: {self}".format(**locals())
+        exception = str(exception).replace('\n', '<br>')
+        # For reporting purposes, we report based on 1-indexed,
+        # not 0-indexed lists (i.e. Try 1 instead of
+        # Try 0 for the first attempt).
+        body = (
+            "Try {try_number} out of {max_tries}<br>"
+            "Exception:<br>{exception}<br>"
+            "Cluster Stderr: {stderr}"
+            "Cluster Stdout: {stdout}"
+            "Spark Log: Attached"
+            "Airflow Log: <a href='{self.log_url}'>Link</a><br>"
+            "Host: {self.hostname}<br>"
+            "Mark success: <a href='{self.mark_success_url}'>Link</a><br>"
+        ).format(try_number=self.try_number, max_tries=self.max_tries + 1, stderr=step_logs['stderr'],
+                 stdout=step_logs['stdout'], **locals())
+        send_email(task.email, title, body, files=files)
